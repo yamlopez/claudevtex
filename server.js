@@ -109,6 +109,18 @@ const TOOLS = [
       }
     }
   },
+  {
+    name: 'get_bank_summary',
+    description: 'Analiza bancos emisores, marcas de tarjeta, cuotas y medios de pago en un período. Resuelve el banco real desde el BIN via binlist.net. Ideal para gráficos de distribución de pagos.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from:       { type: 'string', description: 'Fecha inicio YYYY-MM-DD (default: hace 7 días)' },
+        to:         { type: 'string', description: 'Fecha fin YYYY-MM-DD (default: hoy)' },
+        max_orders: { type: 'number', description: 'Máximo de órdenes a analizar (default: 200, max: 500)' },
+      }
+    }
+  },
 ];
 
 async function callTool(name, input = {}) {
@@ -222,6 +234,121 @@ async function callTool(name, input = {}) {
       totalRevenue:  Math.round(total * 100) / 100,
       avgTicket:     orders.length ? Math.round(total / orders.length * 100) / 100 : 0,
       byStatus,
+    };
+  }
+
+  if (name === 'get_bank_summary') {
+    const to   = input.to   || new Date().toISOString().split('T')[0];
+    const from = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
+    const maxOrders = Math.min(input.max_orders || 200, 500);
+
+    // Traer todas las páginas de órdenes hasta maxOrders
+    const pageSize = 100;
+    const pages = Math.ceil(maxOrders / pageSize);
+    let allOrders = [];
+    for (let p = 0; p < pages; p++) {
+      const offset = p * pageSize;
+      const limit  = Math.min(pageSize, maxOrders - offset);
+      const data   = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=${limit}&page=${p+1}&f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`
+      );
+      allOrders = allOrders.concat(data.list || []);
+      if (allOrders.length >= (data.paging?.total || 0)) break;
+    }
+
+    // Traer detalles en paralelo por lotes de 10 para no saturar la API
+    const details = [];
+    const batchSize = 10;
+    for (let i = 0; i < allOrders.length; i += batchSize) {
+      const batch = allOrders.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        batch.map(o => vtexGet(`/api/oms/pvt/orders/${o.orderId}`))
+      );
+      results.forEach(r => { if (r.status === 'fulfilled') details.push(r.value); });
+      // Pequeña pausa entre lotes para respetar rate limits
+      if (i + batchSize < allOrders.length) await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Extraer BINs únicos y resolverlos todos (con cache, evita duplicados)
+    const uniqueBins = [...new Set(
+      details.flatMap(d => (d.paymentData?.transactions || [])
+        .flatMap(t => (t.payments || []).map(p => p.firstDigits).filter(Boolean))
+      )
+    )];
+
+    // Resolver todos los BINs únicos (con pausa para respetar rate limit de binlist: ~10/min)
+    for (let i = 0; i < uniqueBins.length; i++) {
+      await resolveBank(uniqueBins[i]);
+      if ((i + 1) % 8 === 0) await new Promise(r => setTimeout(r, 6000)); // pausa cada 8 BINs
+    }
+
+    // Acumular estadísticas
+    const byBank      = {};
+    const byBrand     = {};
+    const byMethod    = {};
+    const byInstall   = {};
+    const byBankBrand = {};
+    let totalRevenue  = 0;
+    let ordersWithBin = 0;
+    let ordersNoBin   = 0;
+
+    for (const d of details) {
+      const value = (d.value || 0) / 100;
+      totalRevenue += value;
+      const transactions = d.paymentData?.transactions || [];
+      for (const t of transactions) {
+        for (const p of (t.payments || [])) {
+          const method = p.paymentSystemName || 'Desconocido';
+          byMethod[method] = (byMethod[method] || { count: 0, revenue: 0 });
+          byMethod[method].count++;
+          byMethod[method].revenue += value;
+
+          const inst = p.installments || 1;
+          byInstall[inst] = (byInstall[inst] || 0) + 1;
+
+          if (p.firstDigits) {
+            ordersWithBin++;
+            const { bank, brand } = await resolveBank(p.firstDigits);
+            const bankName  = bank  || 'Desconocido';
+            const brandName = brand || method;
+            const comboKey  = `${bankName} / ${brandName}`;
+
+            byBank[bankName]   = (byBank[bankName]   || { count: 0, revenue: 0 });
+            byBank[bankName].count++;
+            byBank[bankName].revenue += value;
+
+            byBrand[brandName] = (byBrand[brandName] || { count: 0, revenue: 0 });
+            byBrand[brandName].count++;
+            byBrand[brandName].revenue += value;
+
+            byBankBrand[comboKey] = (byBankBrand[comboKey] || { count: 0, revenue: 0 });
+            byBankBrand[comboKey].count++;
+            byBankBrand[comboKey].revenue += value;
+          } else {
+            ordersNoBin++;
+          }
+        }
+      }
+    }
+
+    // Ordenar por count desc
+    const sort = obj => Object.entries(obj)
+      .sort((a, b) => b[1].count - a[1].count)
+      .map(([k, v]) => ({ name: k, count: v.count, revenue: Math.round(v.revenue) }));
+
+    return {
+      period:         { from, to },
+      totalAnalyzed:  details.length,
+      totalRevenue:   Math.round(totalRevenue),
+      ordersWithBin,
+      ordersNoBin,
+      byBank:         sort(byBank),
+      byBrand:        sort(byBrand),
+      byMethod:       sort(byMethod),
+      byBankBrand:    sort(byBankBrand),
+      byInstallments: Object.entries(byInstall)
+        .sort((a, b) => Number(a[0]) - Number(b[0]))
+        .map(([k, v]) => ({ installments: Number(k), count: v })),
     };
   }
 
