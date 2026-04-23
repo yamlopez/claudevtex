@@ -22,81 +22,32 @@ async function vtexGet(path) {
   return res.json();
 }
 
-// ── Tabla de BINs argentinos ───────────────────────────────────
-// Formato: [prefijo, banco, marca]
-// Ordenados de más específico (más dígitos) a menos específico
-const BIN_TABLE = [
-  // Galicia
-  ['450799', 'Galicia', 'Visa'], ['450798', 'Galicia', 'Visa'],
-  ['426535', 'Galicia', 'Visa'], ['426536', 'Galicia', 'Visa'],
-  ['426537', 'Galicia', 'Visa'], ['449321', 'Galicia', 'Visa'],
-  ['449322', 'Galicia', 'Visa'], ['449323', 'Galicia', 'Visa'],
-  ['524403', 'Galicia', 'Mastercard'], ['524404', 'Galicia', 'Mastercard'],
-  ['524405', 'Galicia', 'Mastercard'], ['537483', 'Galicia', 'Mastercard'],
-  ['537484', 'Galicia', 'Mastercard'], ['557498', 'Galicia', 'Mastercard'],
-  // Santander
-  ['415742', 'Santander', 'Visa'], ['415743', 'Santander', 'Visa'],
-  ['423968', 'Santander', 'Visa'], ['423969', 'Santander', 'Visa'],
-  ['446915', 'Santander', 'Visa'], ['446916', 'Santander', 'Visa'],
-  ['511390', 'Santander', 'Mastercard'], ['511391', 'Santander', 'Mastercard'],
-  ['516351', 'Santander', 'Mastercard'], ['516352', 'Santander', 'Mastercard'],
-  ['543465', 'Santander', 'Mastercard'], ['557808', 'Santander', 'Mastercard'],
-  // BBVA
-  ['400434', 'BBVA', 'Visa'], ['400435', 'BBVA', 'Visa'],
-  ['426849', 'BBVA', 'Visa'], ['426850', 'BBVA', 'Visa'],
-  ['447489', 'BBVA', 'Visa'], ['447490', 'BBVA', 'Visa'],
-  ['510918', 'BBVA', 'Mastercard'], ['510919', 'BBVA', 'Mastercard'],
-  ['515489', 'BBVA', 'Mastercard'], ['538379', 'BBVA', 'Mastercard'],
-  ['557648', 'BBVA', 'Mastercard'],
-  // Macro
-  ['408183', 'Macro', 'Visa'], ['408184', 'Macro', 'Visa'],
-  ['428062', 'Macro', 'Visa'], ['449387', 'Macro', 'Visa'],
-  ['449388', 'Macro', 'Visa'], ['510145', 'Macro', 'Mastercard'],
-  ['527571', 'Macro', 'Mastercard'], ['536903', 'Macro', 'Mastercard'],
-  // Nación
-  ['406652', 'Nación', 'Visa'], ['406653', 'Nación', 'Visa'],
-  ['408190', 'Nación', 'Visa'], ['426490', 'Nación', 'Visa'],
-  ['449311', 'Nación', 'Visa'], ['449312', 'Nación', 'Visa'],
-  ['514850', 'Nación', 'Mastercard'], ['514851', 'Nación', 'Mastercard'],
-  ['537099', 'Nación', 'Mastercard'], ['557466', 'Nación', 'Mastercard'],
-  // ICBC
-  ['421648', 'ICBC', 'Visa'], ['421649', 'ICBC', 'Visa'],
-  ['448710', 'ICBC', 'Visa'], ['510136', 'ICBC', 'Mastercard'],
-  ['529628', 'ICBC', 'Mastercard'], ['536793', 'ICBC', 'Mastercard'],
-  // Supervielle
-  ['421566', 'Supervielle', 'Visa'], ['449342', 'Supervielle', 'Visa'],
-  ['449343', 'Supervielle', 'Visa'], ['510158', 'Supervielle', 'Mastercard'],
-  ['527680', 'Supervielle', 'Mastercard'],
-  // Ciudad
-  ['405994', 'Ciudad', 'Visa'], ['405995', 'Ciudad', 'Visa'],
-  ['427742', 'Ciudad', 'Visa'], ['449299', 'Ciudad', 'Visa'],
-  ['519125', 'Ciudad', 'Mastercard'], ['531847', 'Ciudad', 'Mastercard'],
-  // Patagonia
-  ['415423', 'Patagonia', 'Visa'], ['449375', 'Patagonia', 'Visa'],
-  ['510706', 'Patagonia', 'Mastercard'], ['530481', 'Patagonia', 'Mastercard'],
-  // Provincia
-  ['406587', 'Provincia', 'Visa'], ['406588', 'Provincia', 'Visa'],
-  ['426380', 'Provincia', 'Visa'], ['449358', 'Provincia', 'Visa'],
-  ['514258', 'Provincia', 'Mastercard'], ['537328', 'Provincia', 'Mastercard'],
-  // Naranja X
-  ['589657', 'Naranja X', 'Naranja'], ['589658', 'Naranja X', 'Naranja'],
-  ['589659', 'Naranja X', 'Naranja'], ['589660', 'Naranja X', 'Naranja'],
-  ['402927', 'Naranja X', 'Visa'], ['402928', 'Naranja X', 'Visa'],
-  // Cabal
-  ['604201', 'Cabal', 'Cabal'], ['604202', 'Cabal', 'Cabal'],
-  ['604203', 'Cabal', 'Cabal'],
-  // Mercado Pago prepaga
-  ['516259', 'Mercado Pago', 'Mastercard'], ['516260', 'Mercado Pago', 'Mastercard'],
-  ['527601', 'Mercado Pago', 'Mastercard'],
-];
+// ── BIN lookup via binlist.net con cache en memoria ───────────
+const binCache = new Map();
 
-function resolveBank(bin) {
-  if (!bin) return { bank: null, brand: null };
-  const str = String(bin).replace(/\s/g, '');
-  for (const [prefix, bank, brand] of BIN_TABLE) {
-    if (str.startsWith(prefix)) return { bank, brand };
+async function resolveBank(bin) {
+  if (!bin) return { bank: null, brand: null, country: null, type: null };
+  const str = String(bin).replace(/\s/g, '').slice(0, 6);
+  if (binCache.has(str)) return binCache.get(str);
+  try {
+    const res = await fetch(`https://lookup.binlist.net/${str}`, {
+      headers: { 'Accept-Version': '3' }
+    });
+    if (!res.ok) throw new Error(`binlist ${res.status}`);
+    const data = await res.json();
+    const result = {
+      bank:    data.bank?.name    || null,
+      brand:   data.scheme        ? data.scheme.charAt(0).toUpperCase() + data.scheme.slice(1) : null,
+      country: data.country?.name || null,
+      type:    data.type          || null,
+    };
+    binCache.set(str, result);
+    return result;
+  } catch {
+    const fallback = { bank: 'Desconocido', brand: null, country: null, type: null };
+    binCache.set(str, fallback);
+    return fallback;
   }
-  return { bank: 'Desconocido', brand: null };
 }
 
 const TOOLS = [
@@ -188,25 +139,29 @@ async function callTool(name, input = {}) {
 
     // Extraer todos los pagos de todas las transacciones
     const transactions = data.paymentData?.transactions || [];
-    const payments = transactions.flatMap(t =>
-      (t.payments || []).map(p => {
-        const bin        = p.firstDigits || null;
-        const { bank, brand } = resolveBank(bin);
-        return {
-          paymentSystemName: p.paymentSystemName,
-          paymentSystem:     p.paymentSystem,
-          ruleName:          p.ruleName || null,
-          value:             (p.value || 0) / 100,
-          installments:      p.installments || 1,
-          firstDigits:       bin,
-          lastDigits:        p.lastDigits || null,
-          bank,
-          brand,
-          tid:               t.tid || null,
-          transactionId:     t.transactionId || null,
-          lastChange:        t.lastChange || null,
-        };
-      })
+    const payments = await Promise.all(
+      transactions.flatMap(t =>
+        (t.payments || []).map(async p => {
+          const bin = p.firstDigits || null;
+          const { bank, brand, country, type } = await resolveBank(bin);
+          return {
+            paymentSystemName: p.paymentSystemName,
+            paymentSystem:     p.paymentSystem,
+            ruleName:          p.ruleName || null,
+            value:             (p.value || 0) / 100,
+            installments:      p.installments || 1,
+            firstDigits:       bin,
+            lastDigits:        p.lastDigits || null,
+            bank,
+            brand,
+            country,
+            type,
+            tid:               t.tid || null,
+            transactionId:     t.transactionId || null,
+            lastChange:        t.lastChange || null,
+          };
+        })
+      )
     );
 
     return {
