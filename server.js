@@ -38,7 +38,7 @@ const TOOLS = [
   },
   {
     name: 'get_order_detail',
-    description: 'Obtiene el detalle completo de una orden específica por ID',
+    description: 'Obtiene el detalle completo de una orden específica por ID, incluyendo datos de pago, rule name de promoción bancaria y condición de pago',
     inputSchema: {
       type: 'object',
       required: ['orderId'],
@@ -108,15 +108,47 @@ async function callTool(name, input = {}) {
 
   if (name === 'get_order_detail') {
     const data = await vtexGet(`/api/oms/pvt/orders/${input.orderId}`);
+
+    // Extraer todos los pagos de todas las transacciones
+    const transactions = data.paymentData?.transactions || [];
+    const payments = transactions.flatMap(t =>
+      (t.payments || []).map(p => ({
+        paymentSystemName: p.paymentSystemName,
+        paymentSystem:     p.paymentSystem,
+        ruleName:          p.ruleName || null,
+        value:             (p.value || 0) / 100,
+        installments:      p.installments || 1,
+        tid:               t.tid || null,
+        transactionId:     t.transactionId || null,
+        lastChange:        t.lastChange || null,
+      }))
+    );
+
     return {
       orderId:      data.orderId,
       status:       data.status,
       value:        (data.value || 0) / 100,
       creationDate: data.creationDate,
+      lastChange:   data.lastChange,
       customer:     data.clientProfileData,
-      items:        data.items?.map(i => ({ name: i.name, quantity: i.quantity, price: (i.price||0)/100 })),
+      items:        data.items?.map(i => ({
+        name:     i.name,
+        quantity: i.quantity,
+        price:    (i.price || 0) / 100,
+        skuId:    i.id,
+      })),
       shipping:     data.shippingData?.address,
-      payment:      data.paymentData?.transactions?.[0]?.payments?.[0]?.paymentSystemName,
+      // Resumen rápido del primer pago (retrocompatibilidad)
+      payment: {
+        paymentSystemName: payments[0]?.paymentSystemName || null,
+        ruleName:          payments[0]?.ruleName || null,
+        paymentSystem:     payments[0]?.paymentSystem || null,
+        tid:               payments[0]?.tid || null,
+        value:             payments[0]?.value || 0,
+        installments:      payments[0]?.installments || 1,
+      },
+      // Lista completa de pagos (útil para órdenes con múltiples medios de pago)
+      allPayments: payments,
     };
   }
 
@@ -136,15 +168,15 @@ async function callTool(name, input = {}) {
     const from = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
     const data = await vtexGet(`/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`);
     const orders = data.list || [];
-    const total  = orders.reduce((s, o) => s + (o.value||0)/100, 0);
+    const total  = orders.reduce((s, o) => s + (o.value || 0) / 100, 0);
     const byStatus = {};
-    orders.forEach(o => { byStatus[o.status] = (byStatus[o.status]||0)+1; });
+    orders.forEach(o => { byStatus[o.status] = (byStatus[o.status] || 0) + 1; });
     return {
       period:        { from, to },
       totalOrders:   data.paging?.total,
       sampledOrders: orders.length,
       totalRevenue:  Math.round(total * 100) / 100,
-      avgTicket:     orders.length ? Math.round(total/orders.length*100)/100 : 0,
+      avgTicket:     orders.length ? Math.round(total / orders.length * 100) / 100 : 0,
       byStatus,
     };
   }
