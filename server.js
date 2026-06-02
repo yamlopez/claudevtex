@@ -137,6 +137,8 @@ const TOOLS = [
       }
     }
   },
+  {
+    name: 'get_bank_summary',
     description: 'Analiza bancos emisores, marcas de tarjeta, cuotas y medios de pago en un período. Resuelve el banco real desde el BIN via binlist.net. Ideal para gráficos de distribución de pagos.',
     inputSchema: {
       type: 'object',
@@ -206,19 +208,38 @@ async function callTool(name, input = {}) {
       if (allOrders.length < maxOrders) await new Promise(r => setTimeout(r, 200));
     }
 
+    // Enriquecer con detalle individual (la API de listado no devuelve value ni clientProfileData)
+    const enriched = [];
+    for (let i = 0; i < allOrders.length; i += 10) {
+      const batch = allOrders.slice(i, i + 10);
+      const results = await Promise.allSettled(
+        batch.map(o => vtexGet(`/api/oms/pvt/orders/${o.orderId}`))
+      );
+      results.forEach((r, idx) => {
+        const base = batch[idx];
+        const d    = r.status === 'fulfilled' ? r.value : null;
+        enriched.push({
+          orderId:      base.orderId,
+          status:       base.status,
+          value:        d ? (d.value || 0) / 100 : 0,
+          creationDate: base.creationDate,
+          customer:     d ? `${d.clientProfileData?.firstName || ''} ${d.clientProfileData?.lastName || ''}`.trim() : '',
+          email:        d?.clientProfileData?.email || '',
+          items:        d?.items?.length || 0,
+        });
+      });
+      if (i + 10 < allOrders.length) await new Promise(r => setTimeout(r, 200));
+    }
+
+    const totalRevenue = enriched.reduce((s, o) => s + o.value, 0);
+
     return {
       total:      totalInVtex,
-      fetched:    allOrders.length,
-      hasMore:    allOrders.length < totalInVtex,
-      orders: allOrders.map(o => ({
-        orderId:      o.orderId,
-        status:       o.status,
-        value:        (o.value || 0) / 100,
-        creationDate: o.creationDate,
-        customer:     `${o.clientProfileData?.firstName || ''} ${o.clientProfileData?.lastName || ''}`.trim(),
-        email:        o.clientProfileData?.email,
-        items:        o.items?.length || 0,
-      }))
+      fetched:    enriched.length,
+      hasMore:    enriched.length < totalInVtex,
+      totalRevenue: Math.round(totalRevenue * 100) / 100,
+      avgTicket:  enriched.length ? Math.round(totalRevenue / enriched.length * 100) / 100 : 0,
+      orders:     enriched,
     };
   }
 
@@ -317,16 +338,30 @@ async function callTool(name, input = {}) {
       await new Promise(r => setTimeout(r, 200));
     }
 
-    const total   = allOrders.reduce((s, o) => s + (o.value || 0) / 100, 0);
+    // Enriquecer con detalle individual para obtener value real (el listado lo devuelve en 0)
+    const details = [];
+    for (let i = 0; i < allOrders.length; i += 10) {
+      const batch = allOrders.slice(i, i + 10);
+      const results = await Promise.allSettled(
+        batch.map(o => vtexGet(`/api/oms/pvt/orders/${o.orderId}`))
+      );
+      results.forEach(r => { if (r.status === 'fulfilled') details.push(r.value); });
+      if (i + 10 < allOrders.length) await new Promise(r => setTimeout(r, 200));
+    }
+
+    const total    = details.reduce((s, o) => s + (o.value || 0) / 100, 0);
     const byStatus = {};
     allOrders.forEach(o => { byStatus[o.status] = (byStatus[o.status] || 0) + 1; });
 
+    // Calcular ticket promedio solo sobre órdenes con valor > 0 (excluye regalos/gratuitas)
+    const paidOrders = details.filter(o => (o.value || 0) > 0);
+
     return {
-      period:       { from, to },
-      totalOrders:  totalInVtex,
-      analyzedOrders: allOrders.length,
-      totalRevenue: Math.round(total * 100) / 100,
-      avgTicket:    allOrders.length ? Math.round(total / allOrders.length * 100) / 100 : 0,
+      period:         { from, to },
+      totalOrders:    totalInVtex,
+      sampledOrders:  details.length,
+      totalRevenue:   Math.round(total * 100) / 100,
+      avgTicket:      paidOrders.length ? Math.round(total / paidOrders.length * 100) / 100 : 0,
       byStatus,
     };
   }
