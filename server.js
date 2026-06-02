@@ -319,29 +319,67 @@ async function callTool(name, input = {}) {
   if (name === 'get_sales_summary') {
     const to   = input.to   || new Date().toISOString().split('T')[0];
     const from = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
-    const dateFilter = `f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
+    const MAX_ORDERS = Math.min(input.max_orders || 7000, 7000);
 
-    // VTEX limita a 30 páginas (3000 órdenes). Traemos hasta ese máximo.
-    const MAX_PAGES = 30;
+    // VTEX limita a 30 páginas por query (~3000 órdenes).
+    // Para superar ese límite, dividimos el período en chunks de 7 días
+    // y hacemos una query separada por cada chunk.
+    function splitIntoWeeks(fromStr, toStr) {
+      const chunks = [];
+      let cursor = new Date(fromStr + 'T00:00:00.000Z');
+      const end  = new Date(toStr   + 'T23:59:59.999Z');
+      while (cursor < end) {
+        const chunkEnd = new Date(Math.min(cursor.getTime() + 7 * 86400000 - 1, end.getTime()));
+        chunks.push({
+          from: cursor.toISOString(),
+          to:   chunkEnd.toISOString(),
+        });
+        cursor = new Date(chunkEnd.getTime() + 1);
+      }
+      return chunks;
+    }
+
+    async function fetchChunk(chunkFrom, chunkTo) {
+      const dateFilter = `f_creationDate=creationDate:[${chunkFrom} TO ${chunkTo}]`;
+      let orders = [];
+      let page = 1;
+      let totalInChunk = null;
+      while (page <= 30 && orders.length < MAX_ORDERS) {
+        const data = await vtexGet(
+          `/api/oms/pvt/orders?orderBy=creationDate,asc&per_page=100&page=${page}&${dateFilter}`
+        );
+        const list = data.list || [];
+        if (totalInChunk === null) totalInChunk = data.paging?.total || 0;
+        orders = orders.concat(list);
+        if (list.length < 100 || orders.length >= totalInChunk) break;
+        page++;
+        await new Promise(r => setTimeout(r, 150));
+      }
+      return { orders, total: totalInChunk || orders.length };
+    }
+
+    const weeks = splitIntoWeeks(from, to);
     let allOrders = [];
-    let currentPage = 1;
-    let totalInVtex = null;
+    let totalInVtex = 0;
 
-    while (currentPage <= MAX_PAGES) {
-      const data = await vtexGet(
-        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&page=${currentPage}&${dateFilter}`
-      );
-      const list = data.list || [];
-      if (totalInVtex === null) totalInVtex = data.paging?.total || 0;
-      allOrders = allOrders.concat(list);
-      if (list.length < 100 || allOrders.length >= totalInVtex) break;
-      currentPage++;
+    for (const week of weeks) {
+      if (allOrders.length >= MAX_ORDERS) break;
+      const { orders, total } = await fetchChunk(week.from, week.to);
+      allOrders = allOrders.concat(orders);
+      totalInVtex += total;
       await new Promise(r => setTimeout(r, 200));
     }
 
-    // Enriquecer con detalle individual para obtener value real (el listado lo devuelve en 0)
-    // Muestra de hasta 200 órdenes para estimar ticket promedio sin timeout
-    const SAMPLE_SIZE = 200;
+    // Deduplicar por orderId (por si algún chunk se solapa)
+    const seen = new Set();
+    allOrders = allOrders.filter(o => {
+      if (seen.has(o.orderId)) return false;
+      seen.add(o.orderId);
+      return true;
+    });
+
+    // Enriquecer muestra de hasta 300 órdenes con detalle individual para valor real
+    const SAMPLE_SIZE = 300;
     const sampleOrders = allOrders.slice(0, SAMPLE_SIZE);
     const details = [];
     for (let i = 0; i < sampleOrders.length; i += 10) {
@@ -356,25 +394,22 @@ async function callTool(name, input = {}) {
     const byStatus = {};
     allOrders.forEach(o => { byStatus[o.status] = (byStatus[o.status] || 0) + 1; });
 
-    // Calcular ticket promedio solo sobre órdenes con valor > 0 (excluye regalos/gratuitas)
     const paidDetails = details.filter(o => (o.value || 0) > 0);
     const sampleRevenue = paidDetails.reduce((s, o) => s + (o.value || 0) / 100, 0);
     const avgTicket = paidDetails.length ? Math.round(sampleRevenue / paidDetails.length * 100) / 100 : 0;
 
-    // Extrapolar revenue total usando el ticket promedio de la muestra
     const invoicedTotal = byStatus['invoiced'] || 0;
     const estimatedRevenue = Math.round(avgTicket * invoicedTotal * 100) / 100;
 
     return {
-      period:            { from, to },
-      totalOrders:       totalInVtex,
-      sampledOrders:     details.length,
+      period:           { from, to },
+      totalOrders:      totalInVtex,
+      fetchedOrders:    allOrders.length,
+      sampledForTicket: details.length,
       avgTicket,
       estimatedRevenue,
-      note:              totalInVtex > allOrders.length
-        ? `VTEX limita a 30 páginas. Se analizaron ${details.length} órdenes de muestra para estimar el ticket. Revenue estimado sobre ${invoicedTotal} órdenes facturadas.`
-        : `Revenue calculado sobre muestra de ${details.length} órdenes.`,
       byStatus,
+      note: `Período dividido en ${weeks.length} semanas para superar el límite de VTEX. Ticket promedio calculado sobre muestra de ${details.length} órdenes. Revenue estimado sobre ${invoicedTotal} órdenes facturadas.`,
     };
   }
 
