@@ -53,14 +53,16 @@ async function resolveBank(bin) {
 const TOOLS = [
   {
     name: 'get_orders',
-    description: 'Obtiene las últimas órdenes de la tienda VTEX con filtros opcionales de fecha y estado',
+    description: 'Obtiene órdenes de VTEX con paginación. Puede traer hasta max_orders órdenes iterando páginas automáticamente.',
     inputSchema: {
       type: 'object',
       properties: {
-        from:     { type: 'string', description: 'Fecha inicio YYYY-MM-DD (default: hace 7 días)' },
-        to:       { type: 'string', description: 'Fecha fin YYYY-MM-DD (default: hoy)' },
-        status:   { type: 'string', description: 'Estado: invoiced, payment-approved, canceled, handling' },
-        per_page: { type: 'number', description: 'Cantidad de órdenes (max 100, default 50)' },
+        from:       { type: 'string', description: 'Fecha inicio YYYY-MM-DD (default: hace 7 días)' },
+        to:         { type: 'string', description: 'Fecha fin YYYY-MM-DD (default: hoy)' },
+        status:     { type: 'string', description: 'Estado: invoiced, payment-approved, canceled, handling' },
+        max_orders: { type: 'number', description: 'Máximo de órdenes a traer (default: 100, max: 1000). Pagina automáticamente.' },
+        page:       { type: 'number', description: 'Página específica a traer (default: 1). Usar junto con per_page para paginación manual.' },
+        per_page:   { type: 'number', description: 'Órdenes por página (max 100, default 100). Solo aplica si no se usa max_orders.' },
       }
     }
   },
@@ -110,7 +112,31 @@ const TOOLS = [
     }
   },
   {
-    name: 'get_bank_summary',
+    name: 'get_top_products',
+    description: 'Productos más vendidos en un período, ordenados por cantidad vendida o revenue',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from:      { type: 'string', description: 'Fecha inicio YYYY-MM-DD (default: hace 30 días)' },
+        to:        { type: 'string', description: 'Fecha fin YYYY-MM-DD (default: hoy)' },
+        limit:     { type: 'number', description: 'Top N productos (default: 20, max: 100)' },
+        max_orders:{ type: 'number', description: 'Órdenes a analizar (default: 500, max: 1000)' },
+      }
+    }
+  },
+  {
+    name: 'get_customers',
+    description: 'Lista clientes con historial de compras. Permite buscar por email o ver los más recientes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email:     { type: 'string', description: 'Email exacto del cliente a buscar' },
+        from:      { type: 'string', description: 'Fecha inicio YYYY-MM-DD (default: hace 30 días)' },
+        to:        { type: 'string', description: 'Fecha fin YYYY-MM-DD (default: hoy)' },
+        max_orders:{ type: 'number', description: 'Órdenes a analizar (default: 200, max: 500)' },
+      }
+    }
+  },
     description: 'Analiza bancos emisores, marcas de tarjeta, cuotas y medios de pago en un período. Resuelve el banco real desde el BIN via binlist.net. Ideal para gráficos de distribución de pagos.',
     inputSchema: {
       type: 'object',
@@ -125,16 +151,66 @@ const TOOLS = [
 
 async function callTool(name, input = {}) {
   if (name === 'get_orders') {
-    const to   = input.to   || new Date().toISOString().split('T')[0];
-    const from = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
-    const per  = Math.min(input.per_page || 50, 100);
-    let path = `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=${per}&f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
-    if (input.status) path += `&f_status=${input.status}`;
-    const data = await vtexGet(path);
+    const to         = input.to   || new Date().toISOString().split('T')[0];
+    const from       = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
+    const maxOrders  = Math.min(input.max_orders || 100, 1000);
+    const pageSize   = 100;
+    const statusFilter = input.status ? `&f_status=${input.status}` : '';
+    const dateFilter   = `f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
+
+    // Modo paginación manual: solo trae una página específica
+    if (input.page) {
+      const per = Math.min(input.per_page || 50, 100);
+      const data = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=${per}&page=${input.page}&${dateFilter}${statusFilter}`
+      );
+      return {
+        total:       data.paging?.total,
+        pages:       data.paging?.pages,
+        currentPage: input.page,
+        perPage:     per,
+        orders: (data.list || []).map(o => ({
+          orderId:      o.orderId,
+          status:       o.status,
+          value:        (o.value || 0) / 100,
+          creationDate: o.creationDate,
+          customer:     `${o.clientProfileData?.firstName || ''} ${o.clientProfileData?.lastName || ''}`.trim(),
+          email:        o.clientProfileData?.email,
+          items:        o.items?.length || 0,
+        }))
+      };
+    }
+
+    // Modo automático: pagina hasta traer maxOrders órdenes
+    let allOrders = [];
+    let currentPage = 1;
+    let totalInVtex = null;
+
+    while (allOrders.length < maxOrders) {
+      const remaining = maxOrders - allOrders.length;
+      const limit     = Math.min(pageSize, remaining);
+      const data      = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=${limit}&page=${currentPage}&${dateFilter}${statusFilter}`
+      );
+
+      const list = data.list || [];
+      if (totalInVtex === null) totalInVtex = data.paging?.total || 0;
+
+      allOrders = allOrders.concat(list);
+
+      // Parar si ya no hay más páginas o llegamos al total real
+      if (list.length < limit || allOrders.length >= totalInVtex) break;
+      currentPage++;
+
+      // Pausa entre páginas para no saturar la API
+      if (allOrders.length < maxOrders) await new Promise(r => setTimeout(r, 200));
+    }
+
     return {
-      total: data.paging?.total,
-      pages: data.paging?.pages,
-      orders: (data.list || []).map(o => ({
+      total:      totalInVtex,
+      fetched:    allOrders.length,
+      hasMore:    allOrders.length < totalInVtex,
+      orders: allOrders.map(o => ({
         orderId:      o.orderId,
         status:       o.status,
         value:        (o.value || 0) / 100,
@@ -222,17 +298,35 @@ async function callTool(name, input = {}) {
   if (name === 'get_sales_summary') {
     const to   = input.to   || new Date().toISOString().split('T')[0];
     const from = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
-    const data = await vtexGet(`/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`);
-    const orders = data.list || [];
-    const total  = orders.reduce((s, o) => s + (o.value || 0) / 100, 0);
+    const dateFilter = `f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
+
+    // Paginar para traer todas las órdenes del período (no solo las primeras 100)
+    let allOrders = [];
+    let currentPage = 1;
+    let totalInVtex = null;
+
+    while (true) {
+      const data = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&page=${currentPage}&${dateFilter}`
+      );
+      const list = data.list || [];
+      if (totalInVtex === null) totalInVtex = data.paging?.total || 0;
+      allOrders = allOrders.concat(list);
+      if (list.length < 100 || allOrders.length >= totalInVtex) break;
+      currentPage++;
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    const total   = allOrders.reduce((s, o) => s + (o.value || 0) / 100, 0);
     const byStatus = {};
-    orders.forEach(o => { byStatus[o.status] = (byStatus[o.status] || 0) + 1; });
+    allOrders.forEach(o => { byStatus[o.status] = (byStatus[o.status] || 0) + 1; });
+
     return {
-      period:        { from, to },
-      totalOrders:   data.paging?.total,
-      sampledOrders: orders.length,
-      totalRevenue:  Math.round(total * 100) / 100,
-      avgTicket:     orders.length ? Math.round(total / orders.length * 100) / 100 : 0,
+      period:       { from, to },
+      totalOrders:  totalInVtex,
+      analyzedOrders: allOrders.length,
+      totalRevenue: Math.round(total * 100) / 100,
+      avgTicket:    allOrders.length ? Math.round(total / allOrders.length * 100) / 100 : 0,
       byStatus,
     };
   }
@@ -349,6 +443,137 @@ async function callTool(name, input = {}) {
       byInstallments: Object.entries(byInstall)
         .sort((a, b) => Number(a[0]) - Number(b[0]))
         .map(([k, v]) => ({ installments: Number(k), count: v })),
+    };
+  }
+
+  if (name === 'get_top_products') {
+    const to        = input.to   || new Date().toISOString().split('T')[0];
+    const from      = input.from || new Date(Date.now() - 30*86400000).toISOString().split('T')[0];
+    const limit     = Math.min(input.limit || 20, 100);
+    const maxOrders = Math.min(input.max_orders || 500, 1000);
+    const dateFilter = `f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
+
+    // Traer órdenes paginando
+    let allOrders = [];
+    let currentPage = 1;
+    let totalInVtex = null;
+    while (allOrders.length < maxOrders) {
+      const data = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&page=${currentPage}&${dateFilter}&f_status=invoiced`
+      );
+      const list = data.list || [];
+      if (totalInVtex === null) totalInVtex = data.paging?.total || 0;
+      allOrders = allOrders.concat(list);
+      if (list.length < 100 || allOrders.length >= totalInVtex) break;
+      currentPage++;
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    // Traer detalles en lotes de 10
+    const details = [];
+    for (let i = 0; i < allOrders.length; i += 10) {
+      const batch = allOrders.slice(i, i + 10);
+      const results = await Promise.allSettled(
+        batch.map(o => vtexGet(`/api/oms/pvt/orders/${o.orderId}`))
+      );
+      results.forEach(r => { if (r.status === 'fulfilled') details.push(r.value); });
+      if (i + 10 < allOrders.length) await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Acumular por producto
+    const byProduct = {};
+    for (const d of details) {
+      for (const item of (d.items || [])) {
+        const key = item.productId || item.id;
+        if (!byProduct[key]) {
+          byProduct[key] = { productId: key, name: item.name, skuId: item.id, quantity: 0, revenue: 0, orders: 0 };
+        }
+        byProduct[key].quantity += item.quantity || 0;
+        byProduct[key].revenue  += ((item.price || 0) * (item.quantity || 0)) / 100;
+        byProduct[key].orders++;
+      }
+    }
+
+    const sorted = Object.values(byProduct)
+      .sort((a, b) => b.quantity - a.quantity)
+      .slice(0, limit)
+      .map(p => ({ ...p, revenue: Math.round(p.revenue * 100) / 100 }));
+
+    return {
+      period:         { from, to },
+      ordersAnalyzed: details.length,
+      topProducts:    sorted,
+    };
+  }
+
+  if (name === 'get_customers') {
+    const to        = input.to   || new Date().toISOString().split('T')[0];
+    const from      = input.from || new Date(Date.now() - 30*86400000).toISOString().split('T')[0];
+    const maxOrders = Math.min(input.max_orders || 200, 500);
+    const dateFilter = `f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
+
+    // Búsqueda por email vía Master Data
+    if (input.email) {
+      const profile = await vtexGet(
+        `/api/dataentities/CL/search?email=${encodeURIComponent(input.email)}&_fields=id,firstName,lastName,email,phone,document,birthDate,gender`
+      ).catch(() => []);
+      const orders = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=50&clientEmail=${encodeURIComponent(input.email)}`
+      ).catch(() => ({ list: [] }));
+      return {
+        profile: profile[0] || null,
+        totalOrders: orders.paging?.total || 0,
+        recentOrders: (orders.list || []).map(o => ({
+          orderId:      o.orderId,
+          status:       o.status,
+          value:        (o.value || 0) / 100,
+          creationDate: o.creationDate,
+        }))
+      };
+    }
+
+    // Sin email: agrupa por cliente desde órdenes del período
+    let allOrders = [];
+    let currentPage = 1;
+    let totalInVtex = null;
+    while (allOrders.length < maxOrders) {
+      const data = await vtexGet(
+        `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&page=${currentPage}&${dateFilter}`
+      );
+      const list = data.list || [];
+      if (totalInVtex === null) totalInVtex = data.paging?.total || 0;
+      allOrders = allOrders.concat(list);
+      if (list.length < 100 || allOrders.length >= totalInVtex) break;
+      currentPage++;
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    const byCustomer = {};
+    for (const o of allOrders) {
+      const email = o.clientProfileData?.email || 'desconocido';
+      if (!byCustomer[email]) {
+        byCustomer[email] = {
+          email,
+          name: `${o.clientProfileData?.firstName || ''} ${o.clientProfileData?.lastName || ''}`.trim(),
+          orders: 0,
+          totalSpent: 0,
+          lastOrder: o.creationDate,
+        };
+      }
+      byCustomer[email].orders++;
+      byCustomer[email].totalSpent += (o.value || 0) / 100;
+      if (o.creationDate > byCustomer[email].lastOrder) byCustomer[email].lastOrder = o.creationDate;
+    }
+
+    const customers = Object.values(byCustomer)
+      .sort((a, b) => b.totalSpent - a.totalSpent)
+      .map(c => ({ ...c, totalSpent: Math.round(c.totalSpent * 100) / 100 }));
+
+    return {
+      period:          { from, to },
+      ordersAnalyzed:  allOrders.length,
+      uniqueCustomers: customers.length,
+      customers,
     };
   }
 
