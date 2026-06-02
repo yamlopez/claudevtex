@@ -321,12 +321,13 @@ async function callTool(name, input = {}) {
     const from = input.from || new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
     const dateFilter = `f_creationDate=creationDate:[${from}T00:00:00.000Z TO ${to}T23:59:59.999Z]`;
 
-    // Paginar para traer todas las órdenes del período (no solo las primeras 100)
+    // VTEX limita a 30 páginas (3000 órdenes). Traemos hasta ese máximo.
+    const MAX_PAGES = 30;
     let allOrders = [];
     let currentPage = 1;
     let totalInVtex = null;
 
-    while (true) {
+    while (currentPage <= MAX_PAGES) {
       const data = await vtexGet(
         `/api/oms/pvt/orders?orderBy=creationDate,desc&per_page=100&page=${currentPage}&${dateFilter}`
       );
@@ -339,29 +340,40 @@ async function callTool(name, input = {}) {
     }
 
     // Enriquecer con detalle individual para obtener value real (el listado lo devuelve en 0)
+    // Muestra de hasta 200 órdenes para estimar ticket promedio sin timeout
+    const SAMPLE_SIZE = 200;
+    const sampleOrders = allOrders.slice(0, SAMPLE_SIZE);
     const details = [];
-    for (let i = 0; i < allOrders.length; i += 10) {
-      const batch = allOrders.slice(i, i + 10);
+    for (let i = 0; i < sampleOrders.length; i += 10) {
+      const batch = sampleOrders.slice(i, i + 10);
       const results = await Promise.allSettled(
         batch.map(o => vtexGet(`/api/oms/pvt/orders/${o.orderId}`))
       );
       results.forEach(r => { if (r.status === 'fulfilled') details.push(r.value); });
-      if (i + 10 < allOrders.length) await new Promise(r => setTimeout(r, 200));
+      if (i + 10 < sampleOrders.length) await new Promise(r => setTimeout(r, 150));
     }
 
-    const total    = details.reduce((s, o) => s + (o.value || 0) / 100, 0);
     const byStatus = {};
     allOrders.forEach(o => { byStatus[o.status] = (byStatus[o.status] || 0) + 1; });
 
     // Calcular ticket promedio solo sobre órdenes con valor > 0 (excluye regalos/gratuitas)
-    const paidOrders = details.filter(o => (o.value || 0) > 0);
+    const paidDetails = details.filter(o => (o.value || 0) > 0);
+    const sampleRevenue = paidDetails.reduce((s, o) => s + (o.value || 0) / 100, 0);
+    const avgTicket = paidDetails.length ? Math.round(sampleRevenue / paidDetails.length * 100) / 100 : 0;
+
+    // Extrapolar revenue total usando el ticket promedio de la muestra
+    const invoicedTotal = byStatus['invoiced'] || 0;
+    const estimatedRevenue = Math.round(avgTicket * invoicedTotal * 100) / 100;
 
     return {
-      period:         { from, to },
-      totalOrders:    totalInVtex,
-      sampledOrders:  details.length,
-      totalRevenue:   Math.round(total * 100) / 100,
-      avgTicket:      paidOrders.length ? Math.round(total / paidOrders.length * 100) / 100 : 0,
+      period:            { from, to },
+      totalOrders:       totalInVtex,
+      sampledOrders:     details.length,
+      avgTicket,
+      estimatedRevenue,
+      note:              totalInVtex > allOrders.length
+        ? `VTEX limita a 30 páginas. Se analizaron ${details.length} órdenes de muestra para estimar el ticket. Revenue estimado sobre ${invoicedTotal} órdenes facturadas.`
+        : `Revenue calculado sobre muestra de ${details.length} órdenes.`,
       byStatus,
     };
   }
